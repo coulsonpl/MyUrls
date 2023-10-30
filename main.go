@@ -12,6 +12,8 @@ import (
 	"os"
 	"path"
 	"time"
+	"io/ioutil"
+	"regexp"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gomodule/redigo/redis"
@@ -40,8 +42,8 @@ type redisPoolConf struct {
 // letterBytes is a string containing all the characters used in the short URL generation.
 const letterBytes = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
-// shortUrlLen is the length of the generated short URL.
-const shortUrlLen = 7
+// defaultShortUrlLen is the length of the generated short URL.
+const defaultShortUrlLen = 7
 
 // defaultPort is the default port number.
 const defaultPort int = 8002
@@ -70,6 +72,22 @@ var redisPoolConfig *redisPoolConf
 // redisClient is a Redis client.
 var redisClient redis.Conn
 
+func modifyHTMLFile(filePath string, replacement string) error {
+	content, err := ioutil.ReadFile(filePath)
+	if err != nil {
+		return err
+	}
+	re := regexp.MustCompile(`<html(.*?)>`)
+	modifiedContent := re.ReplaceAllStringFunc(string(content), func(s string) string {
+		return "<html " + replacement + ">"
+	})
+	err = ioutil.WriteFile(filePath, []byte(modifiedContent), 0644)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 func main() {
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.Default()
@@ -77,20 +95,28 @@ func main() {
 	// Log 收集中间件
 	router.Use(LoggerToFile())
 
-	router.LoadHTMLGlob("public/*.html")
-
 	port := flag.Int("port", defaultPort, "服务端口")
 	domain := flag.String("domain", "", "短链接域名，必填项")
 	ttl := flag.Int("ttl", defaultExpire, "短链接有效期，单位(天)，默认180天。")
 	conn := flag.String("conn", defaultRedisConfig, "Redis连接，格式: host:port")
 	passwd := flag.String("passwd", "", "Redis连接密码")
 	https := flag.Int("https", 1, "是否返回 https 短链接")
+	linkLen := flag.Int("length", defaultShortUrlLen, "短链接长度，默认7位")
 	flag.Parse()
 
 	if *domain == "" {
 		flag.Usage()
 		log.Fatalln("缺少关键参数")
 	}
+
+	modifyHTMLFile("public/index.html", fmt.Sprintf(`data-backend="%s%s"`, func() string {
+		if *https != 0 {
+			return "https://"
+		}
+		return "http://"
+	}(), *domain))
+
+	router.LoadHTMLGlob("public/*.html")
 
 	redisPoolConfig = &redisPoolConf{
 		maxIdle:        1024,
@@ -148,7 +174,7 @@ func main() {
 			_, _ = redisClient.Do("set", shortKey, longUrl)
 
 		} else {
-			shortKey = longToShort(longUrl, *ttl*secondsPerDay)
+			shortKey = longToShort(longUrl, *ttl*secondsPerDay, *linkLen)
 		}
 
 		protocol := "http://"
@@ -198,7 +224,7 @@ func shortToLong(shortKey string) string {
 }
 
 // 长链接转短链接
-func longToShort(longUrl string, ttl int) string {
+func longToShort(longUrl string, ttl int, linkLen int) string {
 	redisClient = redisPool.Get()
 	defer redisClient.Close()
 
@@ -216,7 +242,7 @@ func longToShort(longUrl string, ttl int) string {
 	// 重试三次
 	var shortKey string
 	for i := 0; i < 3; i++ {
-		shortKey = generate(shortUrlLen)
+		shortKey = generate(linkLen)
 
 		_existsLongUrl, _ := redis.String(redisClient.Do("get", shortKey))
 		if _existsLongUrl == "" {
@@ -259,6 +285,9 @@ func renew(shortKey string) {
 // The letterBytes slice contains characters that can be used to generate a random string.
 // The generation of the random string is based on the current time using the UnixNano() function.
 func generate(bits int) string {
+	// Ensure at least 2 numbers are present in the string
+	numRequired := 2
+
 	// Create a byte slice b of length bits.
 	b := make([]byte, bits)
 
@@ -266,9 +295,25 @@ func generate(bits int) string {
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	// Generate a random byte for each element in the byte slice b using the letterBytes slice.
+	// Track the count of numbers added to the string.
+	numCount := 0
 	for i := range b {
+		// If we still need to add numbers, insert numbers in the string.
+		if numCount < numRequired {
+			if r.Intn(2) == 0 { // Randomly decide to insert a number
+				b[i] = '0' + byte(r.Intn(10)) // Add a random number
+				numCount++
+				continue
+			}
+		}
+
 		b[i] = letterBytes[r.Intn(len(letterBytes))]
 	}
+
+	// Shuffle the byte slice to ensure the position of numbers is random
+	r.Shuffle(len(b), func(i, j int) {
+		b[i], b[j] = b[j], b[i]
+	})
 
 	// Convert the byte slice to a string and return it.
 	return string(b)

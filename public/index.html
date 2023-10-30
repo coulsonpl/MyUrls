@@ -34,7 +34,7 @@
 
   <script>
     const repo = 'https://github.com/CareyWang/MyUrls'
-    const backend = 'http://example.com'
+    const { backend = 'http://example.com' } = document.querySelector('html').dataset
 
     let app = new Vue({
       el: "#app",

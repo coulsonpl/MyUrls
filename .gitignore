@@ -5,3 +5,4 @@ data/
 
 .env
 dist/
+.DS_Store
